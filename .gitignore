@@ -37,3 +37,6 @@ ci/valgrind-check/*.log
 **/fuzz/artifacts
 **/fuzz/corpus
 **/fuzz/coverage
+
+# Local storage improvement proof output
+.local/

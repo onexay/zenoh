@@ -76,3 +76,23 @@ Actual message: {err}",
         })
     );
 }
+
+#[test]
+fn test_readiness_and_acknowledgements_are_explicit_opt_ins() {
+    let mut config = json!({"key_expr":"test/**", "volume":"memory"});
+    let storage = StorageConfig::try_from("plugin", "storage", &config).unwrap();
+    assert!(!storage.required);
+    assert!(!storage.acknowledged_writes);
+    config["required"] = json!(true);
+    config["acknowledged_writes"] = json!(true);
+    let storage = StorageConfig::try_from("plugin", "storage", &config).unwrap();
+    assert!(storage.required);
+    assert!(storage.acknowledged_writes);
+    let roundtrip = StorageConfig::try_from("plugin", "storage", &storage.to_json_value()).unwrap();
+    assert_eq!(storage, roundtrip);
+    for field in ["required", "acknowledged_writes"] {
+        let mut invalid = config.clone();
+        invalid[field] = json!("true");
+        assert!(StorageConfig::try_from("plugin", "storage", &invalid).is_err());
+    }
+}

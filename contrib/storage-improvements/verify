@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "$script_dir/../.." && pwd)
+if [[ $(uname -s) == Darwin ]]; then
+    exec msl --distribution "${MSL_DISTRO:-Dev}" --cd "/mnt/macos$repo_root" \
+        --exec bash "/mnt/macos$script_dir/verify" "$@"
+fi
+if [[ ${1:-} != --skip-build ]]; then
+    "$script_dir/cargo" build --locked -p zenohd -p zenoh-plugin-storage-manager -p zenoh_backend_traits
+    "$repo_root/../zenoh-backend-rocksdb/contrib/storage-improvements/cargo" build --features zenoh/runtime_plugins
+fi
+client_path=$(python3 "$script_dir/prepare_client.py")
+export PYTHONPATH="$client_path${PYTHONPATH:+:$PYTHONPATH}"
+target_dir=${ZENOH_FORK_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/zenoh-fork/target}
+exec python3 "$script_dir/proof.py" "$target_dir/debug"

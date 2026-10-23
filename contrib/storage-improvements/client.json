@@ -1,0 +1,8 @@
+{
+  "version": "1.10.0",
+  "python": {
+    "filename": "eclipse_zenoh-1.10.0-cp39-abi3-manylinux_2_28_aarch64.whl",
+    "url": "https://files.pythonhosted.org/packages/bc/e5/36f3914156f08de895f7eebf104e217433f9db8957597918f9703039c17a/eclipse_zenoh-1.10.0-cp39-abi3-manylinux_2_28_aarch64.whl",
+    "sha256": "5a07b44f43e3a1428544d0223f11afb7a41b39365358dcef0a7798ab1f24e3c1"
+  }
+}

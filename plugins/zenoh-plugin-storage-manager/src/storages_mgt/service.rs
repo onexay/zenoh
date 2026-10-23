@@ -42,6 +42,7 @@ use zenoh_backend_traits::{
 };
 
 use super::LatestUpdates;
+use crate::readiness::{Readiness, WorkerGuard};
 use crate::{
     replication::{Action, Event},
     storages_mgt::{CacheLatest, StorageMessage},
@@ -87,6 +88,8 @@ pub struct StorageService {
     pub(crate) wildcard_deletes: Arc<RwLock<KeBoxTree<Update, UnknownWildness, KeyedSetProvider>>>,
     pub(crate) wildcard_puts: Arc<RwLock<KeBoxTree<Update, UnknownWildness, KeyedSetProvider>>>,
     cache_latest: CacheLatest,
+    readiness: Readiness,
+    write_endpoint: String,
 }
 
 impl StorageService {
@@ -97,7 +100,9 @@ impl StorageService {
         storage: Arc<Mutex<Box<dyn zenoh_backend_traits::Storage>>>,
         capability: Capability,
         cache_latest: CacheLatest,
+        readiness: Readiness,
     ) -> Self {
+        let write_endpoint = format!("@storage/{}/{name}/write", session.zid());
         StorageService {
             session,
             configuration: config,
@@ -107,6 +112,8 @@ impl StorageService {
             wildcard_deletes: Arc::new(RwLock::new(KeBoxTree::default())),
             wildcard_puts: Arc::new(RwLock::new(KeBoxTree::default())),
             cache_latest,
+            readiness,
+            write_endpoint,
         }
     }
 
@@ -143,6 +150,7 @@ impl StorageService {
             Ok(storage_sub) => storage_sub,
             Err(e) => {
                 tracing::error!("Error starting storage '{}': {}", self.name, e);
+                self.readiness.failed(e);
                 return;
             }
         };
@@ -157,6 +165,7 @@ impl StorageService {
             Ok(storage_queryable) => storage_queryable,
             Err(e) => {
                 tracing::error!("Error starting storage '{}': {}", self.name, e);
+                self.readiness.failed(e);
                 return;
             }
         };
@@ -167,7 +176,25 @@ impl StorageService {
             storage_key_expr
         );
 
+        let write_queryable = if self.configuration.acknowledged_writes {
+            match self
+                .session
+                .declare_queryable(self.write_endpoint.clone())
+                .complete(true)
+                .await
+            {
+                Ok(queryable) => Some(queryable),
+                Err(error) => {
+                    self.readiness.failed(error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        self.readiness.ready();
         tokio::task::spawn(async move {
+            let _worker_guard = WorkerGuard(self.readiness.clone());
             loop {
                 tokio::select!(
                     // on sample for key_expr
@@ -176,7 +203,8 @@ impl StorageService {
                             Ok(sample) => sample,
                             Err(e) => {
                                 tracing::error!("Error in sample: {}", e);
-                                continue;
+                                self.readiness.failed(e);
+                                return;
                             }
                         };
                         let timestamp = sample.timestamp().cloned().unwrap_or(self.session.new_timestamp());
@@ -187,13 +215,36 @@ impl StorageService {
                     },
                     // on query on key_expr
                     query = storage_queryable.recv_async() => {
-                        self.reply_query(query).await;
+                        match query {
+                            Ok(query) => self.reply_query(Ok(query)).await,
+                            Err(error) => { self.readiness.failed(error); return; }
+                        }
+                    },
+                    query = async {
+                        match &write_queryable {
+                            Some(queryable) => queryable.recv_async().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match query {
+                            Ok(query) => self.reply_write(query).await,
+                            Err(error) => { self.readiness.failed(error); return; }
+                        }
                     },
                     // on storage handle drop
-                    Ok(message) = rx.recv() => {
+                    message = rx.recv() => {
+                        let message = match message {
+                            Ok(message) => message,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                self.readiness.stopped();
+                                return;
+                            }
+                            Err(error) => { self.readiness.failed(error); return; }
+                        };
                         match message {
                             StorageMessage::Stop => {
                                 tracing::trace!("Dropping storage '{}'", self.name);
+                                self.readiness.stopped();
                                 return
                             },
                             StorageMessage::GetStatus(tx) => {
@@ -210,6 +261,17 @@ impl StorageService {
     // The storage should only simply save the key, sample pair while put and retrieve the same
     // during get the trimming during PUT and GET should be handled by the plugin
     pub(crate) async fn process_sample(&self, sample: Sample) -> ZResult<()> {
+        self.process_sample_with_result(sample, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn process_sample_with_result(
+        &self,
+        sample: Sample,
+        durability: Option<zenoh_ext::StorageWriteDurability>,
+    ) -> ZResult<StorageInsertionResult> {
+        let mut result = StorageInsertionResult::Outdated;
         tracing::trace!("[STORAGE] Processing sample: {:?}", sample.key_expr());
         let SampleFields {
             key_expr,
@@ -346,13 +408,21 @@ impl StorageService {
                 }
             };
 
+            if matches!(
+                durability,
+                Some(zenoh_ext::StorageWriteDurability::LocalSync)
+            ) && storage_result.is_ok()
+            {
+                storage.sync().await?;
+            }
             drop(storage);
 
             match storage_result {
                 Ok(StorageInsertionResult::Outdated) => {
                     tracing::trace!("Ignoring `Outdated` sample < {} >", k);
                 }
-                Ok(_) => {
+                Ok(outcome) => {
+                    result = outcome;
                     if let Some(mut cache_guard) = cache_guard {
                         cache_guard.insert(new_event.log_key(), new_event);
                     }
@@ -361,11 +431,15 @@ impl StorageService {
                     // TODO In case of a wildcard update, multiple keys can be updated. What should
                     //      be the behaviour if one or more of these updates fail?
                     tracing::error!("`{}` on < {} > failed with: {e:?}", sample.kind(), k);
+                    self.readiness.failed(&e);
+                    if durability.is_some() {
+                        return Err(e);
+                    }
                 }
             }
         }
 
-        Ok(())
+        Ok(result)
     }
 
     /// Registers a Wildcard Update, storing it in a dedicated in-memory structure and on disk if
@@ -542,6 +616,118 @@ impl StorageService {
         Some(cache_guard)
     }
 
+    async fn reply_write(&self, query: zenoh::query::Query) {
+        use zenoh_ext::{
+            StorageWriteAck, StorageWriteDurability, StorageWriteOperation, StorageWriteRequest,
+            StorageWriteResult,
+        };
+        let parse = || -> ZResult<(StorageWriteRequest, OwnedKeyExpr)> {
+            if query.key_expr().as_str() != self.write_endpoint {
+                bail!("Write commands require the exact service endpoint");
+            }
+            let attachment = query.attachment().ok_or("Missing write metadata")?;
+            let metadata = attachment.to_bytes();
+            if metadata.len() > 4096 {
+                bail!("Write metadata exceeds 4096 bytes");
+            }
+            let request: StorageWriteRequest = serde_json::from_slice(&metadata)?;
+            let key = request.validate()?;
+            if !self.configuration.key_expr.includes(&key) {
+                bail!("Key is outside this storage");
+            }
+            if (request.operation == StorageWriteOperation::Put) != query.payload().is_some() {
+                bail!("Put requires a payload; delete must not carry one");
+            }
+            Ok((request, key))
+        };
+        let (request, key) = match parse() {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = query
+                    .reply_err(
+                        serde_json::json!({"error": error.to_string(), "may_have_applied": false})
+                            .to_string(),
+                    )
+                    .await;
+                return;
+            }
+        };
+        if request.durability == StorageWriteDurability::LocalSync
+            && !self.storage.lock().await.supports_local_sync()
+        {
+            let _ = query.reply_err(serde_json::json!({"error": "Backend does not support local synchronization", "may_have_applied": false}).to_string()).await;
+            return;
+        }
+        let timestamp = self.session.new_timestamp();
+        let sample: Sample = match request.operation {
+            StorageWriteOperation::Put => {
+                SampleBuilder::put(key.clone(), query.payload().unwrap().clone())
+                    .encoding(query.encoding().cloned().unwrap_or_default())
+                    .timestamp(timestamp)
+                    .into()
+            }
+            StorageWriteOperation::Delete => SampleBuilder::delete(key.clone())
+                .timestamp(timestamp)
+                .into(),
+        };
+        let result = match self
+            .process_sample_with_result(sample, Some(request.durability))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.readiness.failed(&error);
+                tracing::error!("Acknowledged write failed: {error}");
+                let _ = query.reply_err(serde_json::json!({"error": "Backend write or synchronization failed", "may_have_applied": true}).to_string()).await;
+                return;
+            }
+        };
+        let result = match result {
+            StorageInsertionResult::Inserted => StorageWriteResult::Inserted,
+            StorageInsertionResult::Replaced => StorageWriteResult::Replaced,
+            StorageInsertionResult::Outdated => StorageWriteResult::Outdated,
+            StorageInsertionResult::Deleted => StorageWriteResult::Deleted,
+        };
+        if result == StorageWriteResult::Outdated {
+            let _ = query.reply_err(serde_json::json!({"error": "Outdated write was not applied", "may_have_applied": false}).to_string()).await;
+            return;
+        }
+        // Notify live subscribers and other replicas using the same timestamp as the stored record.
+        // This publication does not turn a local acknowledgement into a replica acknowledgement.
+        if result != StorageWriteResult::Outdated {
+            let publication = match request.operation {
+                StorageWriteOperation::Put => {
+                    self.session
+                        .put(key.clone(), query.payload().unwrap().clone())
+                        .encoding(query.encoding().cloned().unwrap_or_default())
+                        .timestamp(timestamp)
+                        .await
+                }
+                StorageWriteOperation::Delete => {
+                    self.session.delete(key.clone()).timestamp(timestamp).await
+                }
+            };
+            if let Err(error) = publication {
+                tracing::warn!("Stored write notification failed: {error}");
+            }
+        }
+        let ack = StorageWriteAck {
+            protocol: 1,
+            operation_id: request.operation_id,
+            key: request.key,
+            service: self.write_endpoint.clone(),
+            durability: request.durability,
+            result,
+            timestamp: timestamp.to_string(),
+        };
+        if let Ok(payload) = serde_json::to_vec(&ack) {
+            let _ = query
+                .reply(self.write_endpoint.clone(), payload)
+                .encoding(zenoh::bytes::Encoding::APPLICATION_JSON)
+                .await;
+        }
+    }
+
     async fn reply_query(&self, query: ZResult<zenoh::query::Query>) {
         let q = match query {
             Ok(q) => q,
@@ -710,3 +896,7 @@ impl Timed for GarbageCollectionEvent {
         tracing::trace!("End garbage collection of obsolete data-infos");
     }
 }
+
+#[cfg(test)]
+#[path = "write_tests.rs"]
+mod write_tests;

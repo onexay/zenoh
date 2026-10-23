@@ -61,6 +61,10 @@ pub struct VolumeConfig {
 }
 #[derive(JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct StorageConfig {
+    #[schemars(with = "Option<bool>")]
+    pub required: bool,
+    #[schemars(with = "Option<bool>")]
+    pub acknowledged_writes: bool,
     pub name: String,
     pub key_expr: OwnedKeyExpr,
     pub complete: bool,
@@ -409,6 +413,11 @@ impl StorageConfig {
     }
     pub fn to_json_value(&self) -> Value {
         let mut result = serde_json::Map::new();
+        result.insert("required".into(), self.required.into());
+        result.insert(
+            "acknowledged_writes".into(),
+            self.acknowledged_writes.into(),
+        );
         result.insert("key_expr".into(), Value::String(self.key_expr.to_string()));
         if let Some(s) = &self.strip_prefix {
             result.insert("strip_prefix".into(), Value::String(s.to_string()));
@@ -434,6 +443,16 @@ impl StorageConfig {
                 plugin_name,
             )
         })?;
+        let acknowledged_writes = match config.get("acknowledged_writes") {
+            Some(Value::Bool(enabled)) => *enabled,
+            None => false,
+            _ => bail!("`acknowledged_writes` field of storage `{storage_name}` must be a boolean"),
+        };
+        let required = match config.get("required") {
+            Some(Value::Bool(required)) => *required,
+            None => false,
+            _ => bail!("`required` field of storage `{storage_name}` must be a boolean"),
+        };
         let key_expr = match config.get("key_expr").and_then(|x| x.as_str()) {
             Some(s) => match keyexpr::new(s) {
                 Ok(ke) => ke.to_owned(),
@@ -639,6 +658,8 @@ impl StorageConfig {
             None => None,
         };
         Ok(StorageConfig {
+            required,
+            acknowledged_writes,
             name: storage_name.into(),
             key_expr,
             complete,

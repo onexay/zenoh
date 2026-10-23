@@ -32,6 +32,7 @@ crate-type = ["cdylib", "rlib"]
 name = "zenoh_plugin_storage_manager"
 
 [dependencies]
+zenoh-ext = { workspace = true, default-features = false, features = ["unstable"] }
 async-trait = { workspace = true }
 bincode = { workspace = true }
 bloomfilter = "1"
