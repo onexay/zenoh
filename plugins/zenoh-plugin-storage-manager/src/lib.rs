@@ -49,6 +49,8 @@ use zenoh_plugin_trait::{
 };
 
 mod memory_backend;
+mod readiness;
+use readiness::{Readiness, StorageState};
 mod replication;
 mod storages_mgt;
 use storages_mgt::*;
@@ -102,6 +104,7 @@ struct StorageRuntimeInner {
     session: Arc<Session>,
     storages: HashMap<String, HashMap<String, Sender<StorageMessage>>>,
     plugins_manager: PluginsManager,
+    readiness: HashMap<String, Readiness>,
 }
 impl StorageRuntimeInner {
     fn status_key(&self) -> String {
@@ -148,7 +151,7 @@ impl StorageRuntimeInner {
             bail!("Cannot start storage manager, 'timestamping' is disabled in the configuration");
         }
 
-        // After this moment result should be only Ok. Failure of loading of one volume or storage should not affect others.
+        // Optional storage failures remain visible without preventing unrelated storages from starting.
 
         let mut new_self = StorageRuntimeInner {
             name,
@@ -156,6 +159,7 @@ impl StorageRuntimeInner {
             session,
             storages: Default::default(),
             plugins_manager,
+            readiness: HashMap::new(),
         };
         new_self
             .spawn_volume(&VolumeConfig {
@@ -182,10 +186,16 @@ impl StorageRuntimeInner {
             );
         }
         for storage in &storages {
-            new_self.spawn_storage(storage).map_or_else(
-                |e| tracing::error!("Cannot spawn storage '{}': {}", storage.name(), e),
-                |_| (),
-            );
+            if let Err(error) = new_self.spawn_storage(storage) {
+                tracing::error!("Cannot spawn storage '{}': {}", storage.name(), error);
+                if storage.required {
+                    bail!(
+                        "Required storage '{}' failed to initialize: {}",
+                        storage.name(),
+                        error
+                    );
+                }
+            }
         }
         Ok(new_self)
     }
@@ -206,6 +216,11 @@ impl StorageRuntimeInner {
         let name = name.as_ref();
         tracing::info!("Killing volume '{}'", name);
         if let Some(storages) = self.storages.remove(name) {
+            for storage in storages.keys() {
+                if let Some(readiness) = self.readiness.remove(storage) {
+                    readiness.stopped();
+                }
+            }
             tokio::task::block_in_place(|| {
                 TOKIO_RUNTIME.block_on(futures::future::join_all(
                     storages
@@ -251,8 +266,11 @@ impl StorageRuntimeInner {
     fn kill_storage(&mut self, config: &StorageConfig) {
         let volume = &config.volume_id;
         tracing::info!("Killing storage '{}' from volume '{}'", config.name, volume);
+        if let Some(readiness) = self.readiness.remove(&config.name) {
+            readiness.stopped();
+        }
         if let Some(storages) = self.storages.get_mut(volume) {
-            if let Some(storage) = storages.get_mut(&config.name) {
+            if let Some(storage) = storages.remove(&config.name) {
                 tracing::debug!(
                     "Closing storage '{}' from volume '{}'",
                     config.name,
@@ -264,6 +282,21 @@ impl StorageRuntimeInner {
         }
     }
     fn spawn_storage(&mut self, storage: &StorageConfig) -> ZResult<()> {
+        let readiness = Readiness::new(storage.required);
+        self.readiness
+            .insert(storage.name.clone(), readiness.clone());
+        let result = self.spawn_storage_inner(storage, readiness.clone());
+        if let Err(error) = &result {
+            readiness.failed(error);
+        }
+        result
+    }
+
+    fn spawn_storage_inner(
+        &mut self,
+        storage: &StorageConfig,
+        readiness: Readiness,
+    ) -> ZResult<()> {
         let admin_key = self.status_key() + "/storages/" + &storage.name;
         let volume_id = storage.volume_id.clone();
         let backend = self
@@ -286,6 +319,7 @@ impl StorageRuntimeInner {
                 storage.clone(),
                 backend.instance(),
                 self.session.clone(),
+                readiness,
             ))
         })?;
         self.storages
@@ -295,6 +329,19 @@ impl StorageRuntimeInner {
         Ok(())
     }
 }
+impl Drop for StorageRuntimeInner {
+    fn drop(&mut self) {
+        for readiness in self.readiness.values() {
+            readiness.stopped();
+        }
+        for storages in self.storages.values() {
+            for handle in storages.values() {
+                let _ = handle.send(StorageMessage::Stop);
+            }
+        }
+    }
+}
+
 impl From<StorageRuntimeInner> for StorageRuntime {
     fn from(inner: StorageRuntimeInner) -> Self {
         StorageRuntime(Arc::new(Mutex::new(inner)))
@@ -303,7 +350,24 @@ impl From<StorageRuntimeInner> for StorageRuntime {
 
 impl PluginControl for StorageRuntime {
     fn report(&self) -> PluginReport {
-        PluginReport::default()
+        let guard = self.0.lock().unwrap();
+        let mut report = PluginReport::default();
+        for (name, readiness) in &guard.readiness {
+            let status = readiness.snapshot();
+            if status.state != StorageState::Ready {
+                let message = format!(
+                    "Storage '{name}' is {:?}: {}",
+                    status.state,
+                    status.error.as_deref().unwrap_or("not ready")
+                );
+                if status.required {
+                    report.add_error(message);
+                } else {
+                    report.add_warning(message);
+                }
+            }
+        }
+        report
     }
     fn plugins_status(&self, names: &keyexpr) -> Vec<PluginStatusRec<'_>> {
         let guard = self.0.lock().unwrap();
@@ -355,6 +419,25 @@ impl RunningPluginTrait for StorageRuntime {
             }
         });
         let guard = self.0.lock().unwrap();
+        with_extended_string(&mut key, &["/readiness"], |key| {
+            if keyexpr::new(key.as_str()).unwrap().intersects(key_expr) {
+                let storages: std::collections::BTreeMap<_, _> = guard
+                    .readiness
+                    .iter()
+                    .map(|(name, readiness)| (name.clone(), readiness.snapshot()))
+                    .collect();
+                let ready = storages
+                    .values()
+                    .all(|status| !status.required || status.state == StorageState::Ready);
+                let healthy = storages
+                    .values()
+                    .all(|status| status.state == StorageState::Ready);
+                responses.push(Response::new(
+                    key.clone(),
+                    serde_json::json!({"ready": ready, "healthy": healthy, "storages": storages}),
+                ));
+            }
+        });
         with_extended_string(&mut key, &["/volumes/"], |key| {
             for plugin in guard.plugins_manager.started_plugins_iter() {
                 with_extended_string(key, &[plugin.id()], |key| {
@@ -381,7 +464,13 @@ impl RunningPluginTrait for StorageRuntime {
                                 TOKIO_RUNTIME.block_on(async {
                                     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
                                     let _ = handle.send(StorageMessage::GetStatus(tx));
-                                    rx.recv().await
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(1),
+                                        rx.recv(),
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten()
                                 })
                             }) {
                                 responses.push(Response::new(key.clone(), value))

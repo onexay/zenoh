@@ -249,6 +249,18 @@ pub trait Storage: Send + Sync {
         timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult>;
 
+    /// Whether `sync` provides local stable-storage completion for accepted writes.
+    /// Backends must opt in explicitly; `Persistence::Durable` alone is insufficient.
+    fn supports_local_sync(&self) -> bool {
+        false
+    }
+
+    /// Synchronize all preceding accepted writes and their recovery metadata to local stable
+    /// storage before returning. This does not imply replica quorum or a cross-backend transaction.
+    async fn sync(&mut self) -> ZResult<()> {
+        Err("Backend does not support explicit local synchronization".into())
+    }
+
     /// Function to retrieve the sample associated with a single key.
     /// A key can be `None` if it matches the `strip_prefix` exactly.
     /// In order to avoid data loss, the storage must retrieve the `value` and `timestamp` associated with the `None` key

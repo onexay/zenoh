@@ -1,0 +1,15 @@
+{
+  "toolchain": "1.97.1",
+  "repositories": {
+    "zenoh": {
+      "upstream": "https://github.com/eclipse-zenoh/zenoh.git",
+      "fork": "https://github.com/onexay/zenoh.git",
+      "base_commit": "766b4558337018e05c2db655254b8fd35ab22ab1"
+    },
+    "zenoh-backend-rocksdb": {
+      "upstream": "https://github.com/eclipse-zenoh/zenoh-backend-rocksdb.git",
+      "fork": "https://github.com/onexay/zenoh-backend-rocksdb.git",
+      "base_commit": "c8242f8556337b2e5167721c0db662f265d34cf0"
+    }
+  }
+}

@@ -18,6 +18,7 @@ use tokio::sync::{broadcast::Sender, Mutex, RwLock};
 use zenoh::{internal::bail, session::Session, Result as ZResult};
 use zenoh_backend_traits::{config::StorageConfig, History, VolumeInstance};
 
+use crate::readiness::Readiness;
 use crate::replication::{Action, Event, LogLatest, LogLatestKey, ReplicationService};
 
 pub(crate) mod service;
@@ -54,6 +55,7 @@ pub(crate) async fn create_and_start_storage(
     config: StorageConfig,
     backend: &VolumeInstance,
     zenoh_session: Arc<Session>,
+    readiness: Readiness,
 ) -> ZResult<Sender<StorageMessage>> {
     tracing::trace!("Create storage '{}'", &admin_key);
     let capability = backend.get_capability();
@@ -113,7 +115,8 @@ pub(crate) async fn create_and_start_storage(
     //
     //      Doing so also allows us to return early from the creation of the Storage, creation which
     //      blocks populating the routing tables.
-    tokio::task::spawn(async move {
+    let initializing = readiness.clone();
+    let initializer = tokio::task::spawn(async move {
         let storage_service = Arc::new(
             StorageService::new(
                 zenoh_session.clone(),
@@ -122,6 +125,7 @@ pub(crate) async fn create_and_start_storage(
                 storage,
                 capability,
                 CacheLatest::new(latest_updates.clone(), replication_log.clone()),
+                readiness,
             )
             .await,
         );
@@ -151,5 +155,10 @@ pub(crate) async fn create_and_start_storage(
             .await;
     });
 
+    tokio::task::spawn(async move {
+        if let Err(error) = initializer.await {
+            initializing.failed(error);
+        }
+    });
     Ok(tx)
 }

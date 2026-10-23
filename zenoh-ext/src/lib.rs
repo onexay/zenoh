@@ -85,3 +85,8 @@ pub use crate::{
     session_ext::SessionExt,
     subscriber_ext::{AdvancedSubscriberBuilderExt, SubscriberBuilderExt, SubscriberForward},
 };
+
+#[cfg(feature = "unstable")]
+mod storage_write;
+#[cfg(feature = "unstable")]
+pub use storage_write::*;
